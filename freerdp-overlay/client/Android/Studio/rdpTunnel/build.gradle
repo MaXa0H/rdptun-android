@@ -1,0 +1,31 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace "com.freerdp.rdptun"
+    compileSdkVersion = rootProject.ext.compileApi
+    buildToolsVersion = rootProject.ext.toolsVersion
+
+    defaultConfig {
+        applicationId "com.freerdp.rdptun"
+        minSdkVersion 33
+        targetSdkVersion rootProject.ext.targetApi
+        versionCode 1
+        versionName "0.1.0"
+    }
+
+    buildTypes {
+        release { minifyEnabled false }
+        debug { jniDebuggable true }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+}
+
+dependencies {
+    implementation project(':freeRDPCore')
+    implementation 'androidx.appcompat:appcompat:1.7.1'
+    implementation 'androidx.core:core:1.19.0'
+}
