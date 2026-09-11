@@ -5,8 +5,7 @@ namespace Rdptun.Plugin
 {
     [ComVisible(true)]
     [Guid("41F85E29-DFE2-45F9-B3F4-C5F646FA8F73")]
-    [ClassInterface(ClassInterfaceType.None)]
-    [ComDefaultInterface(typeof(IWTSPlugin))]
+    [ComDefaultInterface(typeof(RdpPlugin))]
     public sealed class RdpPlugin : IWTSPlugin, IWTSListenerCallback, IWTSVirtualChannelCallback
     {
         private const string ChannelName = "rdptun";
@@ -37,6 +36,7 @@ namespace Rdptun.Plugin
             if (channelManager == null) return E_FAIL;
             try
             {
+                _pipe.SendStatus("IWTSPlugin.Initialize called");
                 int hr = channelManager.CreateListener(ChannelName, 0, this, out _listener);
                 _pipe.SendStatus(hr == S_OK ? "DVC listener created: " + ChannelName : "CreateListener failed: 0x" + hr.ToString("X8"));
                 return hr;
