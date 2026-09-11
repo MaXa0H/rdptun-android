@@ -25,6 +25,8 @@ import java.util.concurrent.Executors;
 public class RdpVpnService extends VpnService implements LibFreeRDP.EventListener {
     public static final String ACTION_START = "com.freerdp.rdptun.START";
     public static final String ACTION_STOP = "com.freerdp.rdptun.STOP";
+    public static final String ACTION_STATUS = "com.freerdp.rdptun.STATUS";
+    public static final String EXTRA_STATUS = "status";
     public static final String EXTRA_SERVER = "server";
     public static final String EXTRA_PORT = "port";
     public static final String EXTRA_USER = "user";
@@ -49,9 +51,6 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
                 NOTIF_CHANNEL, "RDP Tunnel", NotificationManager.IMPORTANCE_LOW));
 
         try {
-            // This is deliberately guarded. Accessing LibFreeRDP triggers its static
-            // native-library loader. If a device cannot load one of the .so files,
-            // keep the VPN process alive long enough to expose the actual error.
             LibFreeRDP.setEventListener(this);
             freeRdpReady = true;
         } catch (Throwable t) {
@@ -76,6 +75,7 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
         String password = intent.getStringExtra(EXTRA_PASSWORD);
 
         startForegroundCompat(buildNotification("VPN service started"));
+        publishStatus("VPN service started");
         stopping = false;
 
         if (!freeRdpReady) {
@@ -142,8 +142,6 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
             if (instance == inst)
                 instance = 0;
             safeCloseTun();
-            // Keep the foreground service alive on failure so its notification keeps
-            // the last diagnostic stage visible. The Disconnect action stops it.
         }
     }
 
@@ -184,8 +182,6 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
                 .addDnsServer("1.1.1.1")
                 .setBlocking(true);
 
-        // API 31-compatible loop prevention: the app hosting the RDP socket is
-        // excluded from its own VPN. Other apps remain routed into the VPN TUN.
         b.addDisallowedApplication(getPackageName());
 
         ParcelFileDescriptor pfd = b.establish();
@@ -245,6 +241,7 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
         if (inst != 0) {
             try { LibFreeRDP.disconnect(inst); } catch (Throwable ignored) {}
         }
+        publishStatus("Disconnected");
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
     }
@@ -278,8 +275,16 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
                 .build();
     }
 
-    private void updateNotification(String text) {
+    private void publishStatus(String text) {
         Log.i(TAG, text);
+        Intent statusIntent = new Intent(ACTION_STATUS)
+                .setPackage(getPackageName())
+                .putExtra(EXTRA_STATUS, text);
+        sendBroadcast(statusIntent);
+    }
+
+    private void updateNotification(String text) {
+        publishStatus(text);
         NotificationManager nm = getSystemService(NotificationManager.class);
         nm.notify(NOTIF_ID, buildNotification(text));
     }
