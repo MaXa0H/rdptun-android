@@ -7,7 +7,7 @@ android {
 
     defaultConfig {
         applicationId "com.freerdp.rdptun"
-        minSdkVersion 33
+        minSdkVersion 31
         targetSdkVersion rootProject.ext.targetApi
         versionCode 1
         versionName "0.1.0"
