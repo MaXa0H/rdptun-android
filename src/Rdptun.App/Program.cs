@@ -16,6 +16,7 @@ namespace Rdptun.App
             Environment.SetEnvironmentVariable(
                 "RDPTUN_TRACE",
                 Path.Combine(Path.GetTempPath(), "rdptun-plugin-" + pid + "-" + token + ".log"));
+            Environment.SetEnvironmentVariable("RDPTUN_CLSID", Guid.NewGuid().ToString("B"));
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
