@@ -1,9 +1,3 @@
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
 #include <objbase.h>
 #include <tsvirtualchannels.h>
@@ -11,8 +5,10 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,7 +25,8 @@ namespace
     constexpr const char* ChannelName = "rdptun";
 
     std::mutex g_traceMutex;
-    HANDLE g_shutdownEvent = nullptr;
+    volatile LONG g_objectCount = 0;
+    volatile LONG g_serverLocks = 0;
 
     std::wstring GetEnv(const wchar_t* name)
     {
@@ -51,36 +48,31 @@ namespace
             return value;
         wchar_t tmp[MAX_PATH]{};
         GetTempPathW(MAX_PATH, tmp);
-        return std::wstring(tmp) + L"rdptun-native-plugin.log";
+        return std::wstring(tmp) + L"rdptun-inproc-plugin.log";
     }
 
     std::wstring GetPipeName()
     {
         std::wstring value = GetEnv(L"RDPTUN_PIPE");
-        if (value.empty())
-            value = L"rdptun-control";
-        return value;
-    }
-
-    GUID GetPluginClsid()
-    {
-        GUID clsid{ 0x41F85E29, 0xDFE2, 0x45F9, {0xB3,0xF4,0xC5,0xF6,0x46,0xFA,0x8F,0x73} };
-        std::wstring value = GetEnv(L"RDPTUN_CLSID");
-        if (!value.empty())
-        {
-            GUID parsed{};
-            if (SUCCEEDED(CLSIDFromString(value.c_str(), &parsed)))
-                clsid = parsed;
-        }
-        return clsid;
+        return value.empty() ? L"rdptun-control" : value;
     }
 
     std::wstring GuidString(REFGUID guid)
     {
         wchar_t buffer[64]{};
-        if (StringFromGUID2(guid, buffer, static_cast<int>(std::size(buffer))) <= 0)
+        if (StringFromGUID2(guid, buffer, _countof(buffer)) <= 0)
             return L"{}";
         return buffer;
+    }
+
+    std::string WideToUtf8(const std::wstring& text)
+    {
+        if (text.empty()) return {};
+        int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+        if (n <= 0) return {};
+        std::string result(static_cast<size_t>(n), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), result.data(), n, nullptr, nullptr);
+        return result;
     }
 
     void Trace(const std::string& text)
@@ -102,29 +94,36 @@ namespace
         CloseHandle(file);
     }
 
-    bool WriteAll(HANDLE h, const void* data, DWORD size)
+    std::string HexHr(HRESULT hr)
     {
-        const BYTE* p = static_cast<const BYTE*>(data);
+        char buffer[16]{};
+        std::snprintf(buffer, sizeof(buffer), "%08lX", static_cast<unsigned long>(hr));
+        return buffer;
+    }
+
+    bool WriteAll(HANDLE handle, const void* data, DWORD size)
+    {
+        const BYTE* cursor = static_cast<const BYTE*>(data);
         while (size > 0)
         {
             DWORD written = 0;
-            if (!WriteFile(h, p, size, &written, nullptr) || written == 0)
+            if (!WriteFile(handle, cursor, size, &written, nullptr) || written == 0)
                 return false;
-            p += written;
+            cursor += written;
             size -= written;
         }
         return true;
     }
 
-    bool ReadAll(HANDLE h, void* data, DWORD size)
+    bool ReadAll(HANDLE handle, void* data, DWORD size)
     {
-        BYTE* p = static_cast<BYTE*>(data);
+        BYTE* cursor = static_cast<BYTE*>(data);
         while (size > 0)
         {
             DWORD read = 0;
-            if (!ReadFile(h, p, size, &read, nullptr) || read == 0)
+            if (!ReadFile(handle, cursor, size, &read, nullptr) || read == 0)
                 return false;
-            p += read;
+            cursor += read;
             size -= read;
         }
         return true;
@@ -135,18 +134,21 @@ namespace
     public:
         using PacketHandler = std::function<void(const std::vector<BYTE>&)>;
 
-        explicit PipeClient(PacketHandler handler)
-            : m_packetHandler(std::move(handler))
+        explicit PipeClient(PacketHandler packetHandler)
+            : m_packetHandler(std::move(packetHandler))
         {
         }
 
-        ~PipeClient() { Stop(); }
+        ~PipeClient()
+        {
+            Stop();
+        }
 
         void Start()
         {
             if (m_running.exchange(true))
                 return;
-            Trace("NativePipeClient.Start pipe=" + WideToUtf8(GetPipeName()));
+            Trace("INPROC PipeClient.Start pipe=" + WideToUtf8(GetPipeName()));
             m_thread = std::thread([this] { Run(); });
         }
 
@@ -154,6 +156,15 @@ namespace
         {
             if (!m_running.exchange(false))
                 return;
+
+            HANDLE pipe = INVALID_HANDLE_VALUE;
+            {
+                std::lock_guard<std::mutex> lock(m_pipeMutex);
+                pipe = m_pipe;
+            }
+            if (pipe != INVALID_HANDLE_VALUE)
+                CancelIoEx(pipe, nullptr);
+
             if (m_thread.joinable())
             {
                 CancelSynchronousIo(static_cast<HANDLE>(m_thread.native_handle()));
@@ -186,16 +197,6 @@ namespace
             SendFrame(FrameDvcClosed, {});
         }
 
-        static std::string WideToUtf8(const std::wstring& text)
-        {
-            if (text.empty()) return {};
-            int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
-            if (n <= 0) return {};
-            std::string out(static_cast<size_t>(n), '\0');
-            WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), n, nullptr, nullptr);
-            return out;
-        }
-
     private:
         void Run()
         {
@@ -215,14 +216,15 @@ namespace
                     std::lock_guard<std::mutex> lock(m_pipeMutex);
                     m_pipe = pipe;
                 }
-                Trace("IPC connected");
-                SendStatus("DVC plugin IPC connected (native)");
+                Trace("INPROC IPC connected");
+                SendStatus("DVC plugin IPC connected (native in-proc)");
 
                 while (m_running.load())
                 {
                     BYTE header[5]{};
-                    if (!ReadAll(pipe, header, 5))
+                    if (!ReadAll(pipe, header, sizeof(header)))
                         break;
+
                     DWORD length = static_cast<DWORD>(header[1]) |
                         (static_cast<DWORD>(header[2]) << 8) |
                         (static_cast<DWORD>(header[3]) << 16) |
@@ -232,6 +234,7 @@ namespace
                         Trace("IPC invalid frame length=" + std::to_string(length));
                         break;
                     }
+
                     std::vector<BYTE> payload(length);
                     if (length != 0 && !ReadAll(pipe, payload.data(), length))
                         break;
@@ -254,6 +257,7 @@ namespace
         {
             if (payload.size() > MaxPipeFrame)
                 return;
+
             std::lock_guard<std::mutex> writeLock(m_writeMutex);
             HANDLE pipe = INVALID_HANDLE_VALUE;
             {
@@ -271,7 +275,7 @@ namespace
                 static_cast<BYTE>(length >> 16),
                 static_cast<BYTE>(length >> 24)
             };
-            if (!WriteAll(pipe, header, 5))
+            if (!WriteAll(pipe, header, sizeof(header)))
                 return;
             if (length != 0)
                 WriteAll(pipe, payload.data(), length);
@@ -291,25 +295,27 @@ namespace
         RdpPlugin()
             : m_pipe([this](const std::vector<BYTE>& packet) { SendPacketToDvc(packet); })
         {
+            InterlockedIncrement(&g_objectCount);
+            Trace("INPROC RdpPlugin constructed");
             m_pipe.Start();
-            m_pipe.SendStatus("RDP DVC native plugin object created; clsid=" + PipeClient::WideToUtf8(GuidString(GetPluginClsid())));
-            Trace("NATIVE COM object constructed");
+            m_pipe.SendStatus("RDP DVC native in-proc plugin object created");
         }
 
         ~RdpPlugin()
         {
-            Trace("NATIVE COM object destroyed");
+            Trace("INPROC RdpPlugin destroyed");
             ClearChannel();
             if (m_listener) { m_listener->Release(); m_listener = nullptr; }
             if (m_manager) { m_manager->Release(); m_manager = nullptr; }
             m_pipe.Stop();
+            InterlockedDecrement(&g_objectCount);
         }
 
         HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override
         {
             if (!ppvObject) return E_POINTER;
             *ppvObject = nullptr;
-            Trace("NATIVE QI iid=" + PipeClient::WideToUtf8(GuidString(riid)));
+            Trace("INPROC QI iid=" + WideToUtf8(GuidString(riid)));
 
             if (riid == IID_IUnknown || riid == __uuidof(IWTSPlugin))
                 *ppvObject = static_cast<IWTSPlugin*>(this);
@@ -339,8 +345,8 @@ namespace
 
         HRESULT STDMETHODCALLTYPE Initialize(IWTSVirtualChannelManager* channelManager) override
         {
-            Trace("IWTSPlugin.Initialize ENTER (native)");
-            m_pipe.SendStatus("IWTSPlugin.Initialize called (native)");
+            Trace("IWTSPlugin.Initialize ENTER (native in-proc)");
+            m_pipe.SendStatus("IWTSPlugin.Initialize called (native in-proc)");
             if (!channelManager)
                 return E_POINTER;
 
@@ -349,25 +355,29 @@ namespace
             m_manager->AddRef();
 
             if (m_listener) { m_listener->Release(); m_listener = nullptr; }
-            HRESULT hr = m_manager->CreateListener(const_cast<LPSTR>(ChannelName), 0,
-                static_cast<IWTSListenerCallback*>(this), &m_listener);
+            HRESULT hr = m_manager->CreateListener(
+                const_cast<LPSTR>(ChannelName),
+                0,
+                static_cast<IWTSListenerCallback*>(this),
+                &m_listener);
+
             if (SUCCEEDED(hr))
-                m_pipe.SendStatus("DVC listener created: rdptun (native)");
+                m_pipe.SendStatus("DVC listener created: rdptun (native in-proc)");
             else
-                m_pipe.SendStatus("CreateListener failed (native): 0x" + HexHr(hr));
+                m_pipe.SendStatus("CreateListener failed (native in-proc): 0x" + HexHr(hr));
             return hr;
         }
 
         HRESULT STDMETHODCALLTYPE Connected() override
         {
-            m_pipe.SendStatus("RDP client reports Connected (native)");
+            m_pipe.SendStatus("RDP client reports Connected (native in-proc)");
             return S_OK;
         }
 
         HRESULT STDMETHODCALLTYPE Disconnected(DWORD disconnectCode) override
         {
             ClearChannel();
-            m_pipe.SendStatus("RDP disconnected (native): 0x" + HexHr(static_cast<HRESULT>(disconnectCode)));
+            m_pipe.SendStatus("RDP disconnected (native in-proc): 0x" + HexHr(static_cast<HRESULT>(disconnectCode)));
             m_pipe.SendDvcClosed();
             return S_OK;
         }
@@ -375,7 +385,7 @@ namespace
         HRESULT STDMETHODCALLTYPE Terminated() override
         {
             ClearChannel();
-            m_pipe.SendStatus("DVC plugin terminated (native)");
+            m_pipe.SendStatus("DVC plugin terminated (native in-proc)");
             m_pipe.SendDvcClosed();
             return S_OK;
         }
@@ -404,7 +414,7 @@ namespace
             *callback = static_cast<IWTSVirtualChannelCallback*>(this);
             AddRef();
 
-            m_pipe.SendStatus("DVC rdptun opened (native)");
+            m_pipe.SendStatus("DVC rdptun opened (native in-proc)");
             m_pipe.SendDvcOpened();
             return S_OK;
         }
@@ -418,7 +428,7 @@ namespace
             if (m_rx.size() + size > 65536)
             {
                 m_rx.clear();
-                m_pipe.SendStatus("DVC RX buffer overflow (native)");
+                m_pipe.SendStatus("DVC RX buffer overflow (native in-proc)");
                 return E_FAIL;
             }
             m_rx.insert(m_rx.end(), buffer, buffer + size);
@@ -430,7 +440,7 @@ namespace
                 if (length == 0 || length > MaxDvcPacket)
                 {
                     m_rx.clear();
-                    m_pipe.SendStatus("Invalid DVC packet length (native): " + std::to_string(length));
+                    m_pipe.SendStatus("Invalid DVC packet length (native in-proc): " + std::to_string(length));
                     return E_FAIL;
                 }
                 if (m_rx.size() - offset < length + 2)
@@ -439,6 +449,7 @@ namespace
                 m_pipe.SendPacketFromDvc(m_rx.data() + offset + 2, length);
                 offset += length + 2;
             }
+
             if (offset > 0)
                 m_rx.erase(m_rx.begin(), m_rx.begin() + static_cast<ptrdiff_t>(offset));
             return S_OK;
@@ -447,19 +458,12 @@ namespace
         HRESULT STDMETHODCALLTYPE OnClose() override
         {
             ClearChannel();
-            m_pipe.SendStatus("DVC rdptun closed (native)");
+            m_pipe.SendStatus("DVC rdptun closed (native in-proc)");
             m_pipe.SendDvcClosed();
             return S_OK;
         }
 
     private:
-        static std::string HexHr(HRESULT hr)
-        {
-            char buffer[16]{};
-            std::snprintf(buffer, sizeof(buffer), "%08lX", static_cast<unsigned long>(hr));
-            return buffer;
-        }
-
         void ClearChannel()
         {
             std::lock_guard<std::mutex> lock(m_channelMutex);
@@ -487,11 +491,12 @@ namespace
             std::vector<BYTE> frame(packet.size() + 2);
             frame[0] = static_cast<BYTE>(packet.size() >> 8);
             frame[1] = static_cast<BYTE>(packet.size());
-            memcpy(frame.data() + 2, packet.data(), packet.size());
+            std::memcpy(frame.data() + 2, packet.data(), packet.size());
+
             HRESULT hr = channel->Write(static_cast<ULONG>(frame.size()), frame.data(), nullptr);
             channel->Release();
             if (FAILED(hr))
-                m_pipe.SendStatus("DVC Write failed (native): 0x" + HexHr(hr));
+                m_pipe.SendStatus("DVC Write failed (native in-proc): 0x" + HexHr(hr));
         }
 
         volatile LONG m_refCount = 1;
@@ -507,6 +512,18 @@ namespace
     class ClassFactory final : public IClassFactory
     {
     public:
+        ClassFactory()
+        {
+            InterlockedIncrement(&g_objectCount);
+            Trace("INPROC ClassFactory constructed");
+        }
+
+        ~ClassFactory()
+        {
+            Trace("INPROC ClassFactory destroyed");
+            InterlockedDecrement(&g_objectCount);
+        }
+
         HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override
         {
             if (!ppvObject) return E_POINTER;
@@ -526,13 +543,14 @@ namespace
         ULONG STDMETHODCALLTYPE Release() override
         {
             ULONG value = static_cast<ULONG>(InterlockedDecrement(&m_refCount));
-            if (value == 0) delete this;
+            if (value == 0)
+                delete this;
             return value;
         }
 
         HRESULT STDMETHODCALLTYPE CreateInstance(IUnknown* outer, REFIID riid, void** ppvObject) override
         {
-            Trace("CLASSFACTORY CreateInstance native riid=" + PipeClient::WideToUtf8(GuidString(riid)));
+            Trace("CLASSFACTORY CreateInstance inproc riid=" + WideToUtf8(GuidString(riid)));
             if (!ppvObject) return E_POINTER;
             *ppvObject = nullptr;
             if (outer) return CLASS_E_NOAGGREGATION;
@@ -541,124 +559,53 @@ namespace
             if (!plugin) return E_OUTOFMEMORY;
             HRESULT hr = plugin->QueryInterface(riid, ppvObject);
             plugin->Release();
-            Trace(std::string("CLASSFACTORY CreateInstance native hr=0x") + Hex(hr));
+            Trace("CLASSFACTORY CreateInstance inproc hr=0x" + HexHr(hr));
             return hr;
         }
 
-        HRESULT STDMETHODCALLTYPE LockServer(BOOL) override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE LockServer(BOOL lock) override
+        {
+            if (lock)
+                InterlockedIncrement(&g_serverLocks);
+            else
+                InterlockedDecrement(&g_serverLocks);
+            return S_OK;
+        }
 
     private:
-        static std::string Hex(HRESULT hr)
-        {
-            char buffer[16]{};
-            std::snprintf(buffer, sizeof(buffer), "%08lX", static_cast<unsigned long>(hr));
-            return buffer;
-        }
         volatile LONG m_refCount = 1;
     };
-
-    bool SetStringValue(HKEY root, const std::wstring& path, const wchar_t* name, const std::wstring& value)
-    {
-        HKEY key = nullptr;
-        if (RegCreateKeyExW(root, path.c_str(), 0, nullptr, 0, KEY_WRITE, nullptr, &key, nullptr) != ERROR_SUCCESS)
-            return false;
-        const BYTE* data = reinterpret_cast<const BYTE*>(value.c_str());
-        DWORD bytes = static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t));
-        LONG rc = RegSetValueExW(key, name, 0, REG_SZ, data, bytes);
-        RegCloseKey(key);
-        return rc == ERROR_SUCCESS;
-    }
-
-    std::wstring ModulePath()
-    {
-        std::wstring path(32768, L'\0');
-        DWORD n = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-        if (n == 0 || n >= path.size())
-            return {};
-        path.resize(n);
-        return path;
-    }
-
-    bool RegisterPlugin()
-    {
-        GUID clsid = GetPluginClsid();
-        std::wstring clsidText = GuidString(clsid);
-        std::wstring addin = L"Software\\Microsoft\\Terminal Server Client\\Default\\AddIns\\Rdptun";
-        std::wstring localServer = L"Software\\Classes\\CLSID\\" + clsidText + L"\\LocalServer32";
-        std::wstring exe = L"\"" + ModulePath() + L"\"";
-        bool ok1 = SetStringValue(HKEY_CURRENT_USER, addin, L"Name", clsidText);
-        bool ok2 = SetStringValue(HKEY_CURRENT_USER, localServer, nullptr, exe);
-        Trace("REGISTER native clsid=" + PipeClient::WideToUtf8(clsidText));
-        return ok1 && ok2;
-    }
-
-    bool UnregisterPlugin()
-    {
-        GUID clsid = GetPluginClsid();
-        std::wstring clsidText = GuidString(clsid);
-        RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Terminal Server Client\\Default\\AddIns\\Rdptun");
-        std::wstring clsidPath = L"Software\\Classes\\CLSID\\" + clsidText;
-        RegDeleteTreeW(HKEY_CURRENT_USER, clsidPath.c_str());
-        return true;
-    }
 }
 
-int wmain(int argc, wchar_t** argv)
+extern "C" __declspec(dllexport) HRESULT __stdcall DllGetClassObject(
+    REFCLSID rclsid,
+    REFIID riid,
+    LPVOID* ppv)
 {
-    if (argc > 1)
-    {
-        if (_wcsicmp(argv[1], L"/register") == 0 || _wcsicmp(argv[1], L"-register") == 0)
-            return RegisterPlugin() ? 0 : 1;
-        if (_wcsicmp(argv[1], L"/unregister") == 0 || _wcsicmp(argv[1], L"-unregister") == 0)
-            return UnregisterPlugin() ? 0 : 1;
-    }
+    Trace("DllGetClassObject clsid=" + WideToUtf8(GuidString(rclsid)) +
+        " riid=" + WideToUtf8(GuidString(riid)));
 
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hr))
-        return 2;
+    if (!ppv) return E_POINTER;
+    *ppv = nullptr;
 
-    g_shutdownEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_shutdownEvent)
-    {
-        CoUninitialize();
-        return 3;
-    }
-
-    GUID clsid = GetPluginClsid();
     ClassFactory* factory = new (std::nothrow) ClassFactory();
-    if (!factory)
-    {
-        CloseHandle(g_shutdownEvent);
-        CoUninitialize();
-        return 4;
-    }
-
-    DWORD cookie = 0;
-    hr = CoRegisterClassObject(clsid, factory, CLSCTX_LOCAL_SERVER,
-        REGCLS_MULTIPLEUSE | REGCLS_SUSPENDED, &cookie);
+    if (!factory) return E_OUTOFMEMORY;
+    HRESULT hr = factory->QueryInterface(riid, ppv);
     factory->Release();
-    if (FAILED(hr))
+    Trace("DllGetClassObject hr=0x" + HexHr(hr));
+    return hr;
+}
+
+extern "C" __declspec(dllexport) HRESULT __stdcall DllCanUnloadNow()
+{
+    return (g_objectCount == 0 && g_serverLocks == 0) ? S_OK : S_FALSE;
+}
+
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH)
     {
-        CloseHandle(g_shutdownEvent);
-        CoUninitialize();
-        return 5;
+        DisableThreadLibraryCalls(instance);
     }
-
-    hr = CoResumeClassObjects();
-    if (FAILED(hr))
-    {
-        CoRevokeClassObject(cookie);
-        CloseHandle(g_shutdownEvent);
-        CoUninitialize();
-        return 6;
-    }
-
-    Trace("Native COM LocalServer ready clsid=" + PipeClient::WideToUtf8(GuidString(clsid)));
-    WaitForSingleObject(g_shutdownEvent, INFINITE);
-
-    CoRevokeClassObject(cookie);
-    CloseHandle(g_shutdownEvent);
-    g_shutdownEvent = nullptr;
-    CoUninitialize();
-    return 0;
+    return TRUE;
 }
