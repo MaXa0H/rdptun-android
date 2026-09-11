@@ -35,6 +35,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           msbuild Rdptun.sln /m /restore /p:Configuration=Release /p:Platform=x64
+          msbuild src\Rdptun.NativePlugin\Rdptun.NativePlugin.vcxproj /m /p:Configuration=Release /p:Platform=x64
 
       - name: Package
         shell: pwsh
@@ -44,8 +45,7 @@ jobs:
           Copy-Item src\Rdptun.App\bin\x64\Release\Rdptun.exe dist\
           Copy-Item src\Rdptun.App\bin\x64\Release\Rdptun.exe.config dist\
           Copy-Item src\Rdptun.App\bin\x64\Release\Rdptun.Common.dll dist\
-          Copy-Item src\Rdptun.Plugin\bin\x64\Release\Rdptun.Plugin.exe dist\
-          Copy-Item src\Rdptun.Plugin\bin\x64\Release\Rdptun.Plugin.exe.config dist\
+          Copy-Item src\Rdptun.NativePlugin\bin\x64\Release\Rdptun.Plugin.exe dist\
           Copy-Item vendor\wintun\amd64\wintun.dll dist\
           Copy-Item README.md dist\
           Copy-Item THIRD_PARTY_NOTICES.md dist\
