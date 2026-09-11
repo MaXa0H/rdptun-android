@@ -17,10 +17,10 @@ namespace Rdptun.Plugin
 
         public static string TracePath
         {
-            get { return Path.Combine(Path.GetTempPath(), "rdptun-plugin.log"); }
+            get { return PipeProtocol.TracePath; }
         }
 
-        private static void Trace(string text)
+        public static void Trace(string text)
         {
             try
             {
@@ -33,7 +33,7 @@ namespace Rdptun.Plugin
 
         public void Start()
         {
-            Trace("PluginPipeClient.Start");
+            Trace("PluginPipeClient.Start pipe=" + PipeProtocol.PipeName);
             _running = true;
             _thread = new Thread(Loop) { IsBackground = true, Name = "rdptun-plugin-pipe" };
             _thread.Start();
@@ -47,7 +47,7 @@ namespace Rdptun.Plugin
                 {
                     using (NamedPipeClientStream pipe = new NamedPipeClientStream(".", PipeProtocol.PipeName, PipeDirection.InOut, PipeOptions.None))
                     {
-                        Trace("connecting IPC pipe");
+                        Trace("connecting IPC pipe=" + PipeProtocol.PipeName);
                         pipe.Connect(1000);
                         _pipe = pipe;
                         Trace("IPC connected");
