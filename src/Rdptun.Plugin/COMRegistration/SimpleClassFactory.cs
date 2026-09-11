@@ -1,6 +1,6 @@
 using System;
-using System.IO;
 using System.Runtime.InteropServices;
+using Rdptun.Common;
 
 namespace COMRegistration
 {
@@ -19,16 +19,11 @@ namespace COMRegistration
     {
         private static readonly Guid IidIUnknown = new Guid("00000000-0000-0000-C000-000000000046");
 
-        private static string TracePath
-        {
-            get { return Path.Combine(Path.GetTempPath(), "rdptun-plugin.log"); }
-        }
-
         private static void Trace(string text)
         {
             try
             {
-                File.AppendAllText(TracePath,
+                System.IO.File.AppendAllText(PipeProtocol.TracePath,
                     DateTime.Now.ToString("HH:mm:ss.fff") + " pid=" + System.Diagnostics.Process.GetCurrentProcess().Id +
                     " CLASSFACTORY " + text + Environment.NewLine);
             }
