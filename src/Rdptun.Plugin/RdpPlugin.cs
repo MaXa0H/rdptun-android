@@ -21,14 +21,24 @@ namespace Rdptun.Plugin
         private IWTSListener _listener;
         private readonly PluginPipeClient _pipe;
 
-        public static Guid PluginClsid { get { return new Guid("41F85E29-DFE2-45F9-B3F4-C5F646FA8F73"); } }
+        public static Guid PluginClsid
+        {
+            get
+            {
+                string value = Environment.GetEnvironmentVariable("RDPTUN_CLSID");
+                Guid parsed;
+                if (!string.IsNullOrWhiteSpace(value) && Guid.TryParse(value, out parsed))
+                    return parsed;
+                return new Guid("41F85E29-DFE2-45F9-B3F4-C5F646FA8F73");
+            }
+        }
 
         public RdpPlugin()
         {
             _pipe = new PluginPipeClient();
             _pipe.PacketToDvc += SendPacketToDvc;
             _pipe.Start();
-            _pipe.SendStatus("RDP DVC plugin object created");
+            _pipe.SendStatus("RDP DVC plugin object created; clsid=" + PluginClsid.ToString("B"));
         }
 
         public int Initialize(IWTSVirtualChannelManager channelManager)
