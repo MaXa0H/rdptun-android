@@ -41,7 +41,7 @@
   <PropertyGroup>
     <OutDir>$(MSBuildProjectDirectory)\bin\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(MSBuildProjectDirectory)\obj\$(Platform)\$(Configuration)\</IntDir>
-    <TargetName>Rdptun.Plugin.Native</TargetName>
+    <TargetName>Rdptun.Plugin</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
