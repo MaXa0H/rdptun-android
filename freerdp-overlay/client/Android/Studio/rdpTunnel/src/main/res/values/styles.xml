@@ -1,5 +1,0 @@
-<resources>
-    <style name="AppTheme" parent="Theme.AppCompat.DayNight.DarkActionBar">
-        <item name="android:fontFamily">sans</item>
-    </style>
-</resources>

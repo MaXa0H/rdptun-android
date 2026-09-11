@@ -1,0 +1,61 @@
+name: Build Windows x64
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: rdptun-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Download Wintun 0.14.1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile wintun.zip
+          Expand-Archive wintun.zip -DestinationPath vendor -Force
+          $dll = Get-ChildItem vendor -Recurse -Filter wintun.dll | Where-Object { $_.FullName -match '[\\/]amd64[\\/]' } | Select-Object -First 1
+          if (-not $dll) { throw 'amd64 wintun.dll not found in archive' }
+          New-Item -ItemType Directory -Force -Path vendor\wintun\amd64 | Out-Null
+          Copy-Item $dll.FullName vendor\wintun\amd64\wintun.dll -Force
+
+      - name: Build Release x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          msbuild Rdptun.sln /m /restore /p:Configuration=Release /p:Platform=x64
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item src\Rdptun.App\bin\x64\Release\Rdptun.exe dist\
+          Copy-Item src\Rdptun.App\bin\x64\Release\Rdptun.exe.config dist\
+          Copy-Item src\Rdptun.App\bin\x64\Release\Rdptun.Common.dll dist\
+          Copy-Item src\Rdptun.Plugin\bin\x64\Release\Rdptun.Plugin.exe dist\
+          Copy-Item src\Rdptun.Plugin\bin\x64\Release\Rdptun.Plugin.exe.config dist\
+          Copy-Item vendor\wintun\amd64\wintun.dll dist\
+          Copy-Item README.md dist\
+          Copy-Item THIRD_PARTY_NOTICES.md dist\
+          Compress-Archive -Path dist\* -DestinationPath rdptun-windows-x64.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdptun-windows-x64
+          path: |
+            rdptun-windows-x64.zip
+            dist/
+          if-no-files-found: error
