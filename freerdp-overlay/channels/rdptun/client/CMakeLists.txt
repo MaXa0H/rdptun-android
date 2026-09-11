@@ -1,0 +1,5 @@
+define_channel_client("rdptun")
+set(${MODULE_PREFIX}_SRCS rdptun_main.c rdptun_main.h)
+set(${MODULE_PREFIX}_LIBS winpr)
+include_directories(..)
+add_channel_client_library(${MODULE_PREFIX} ${MODULE_NAME} ${CHANNEL_NAME} TRUE "DVCPluginEntry")
