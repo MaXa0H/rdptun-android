@@ -7,7 +7,7 @@ namespace Rdptun.Plugin
     [Guid("41F85E29-DFE2-45F9-B3F4-C5F646FA8F73")]
     [ClassInterface(ClassInterfaceType.None)]
     [ComDefaultInterface(typeof(IWTSPlugin))]
-    public sealed class RdpPlugin : IWTSPlugin, IWTSListenerCallback, IWTSVirtualChannelCallback, ICustomQueryInterface
+    public sealed class RdpPlugin : IWTSPlugin, IWTSListenerCallback, IWTSVirtualChannelCallback
     {
         private const string ChannelName = "rdptun";
         private const int MaxPacket = 4096;
@@ -40,59 +40,29 @@ namespace Rdptun.Plugin
             _pipe.PacketToDvc += SendPacketToDvc;
             _pipe.Start();
             _pipe.SendStatus("RDP DVC plugin object created; clsid=" + PluginClsid.ToString("B"));
-        }
-
-        public CustomQueryInterfaceResult GetInterface(ref Guid iid, out IntPtr ppv)
-        {
-            ppv = IntPtr.Zero;
-            PluginPipeClient.Trace("QUERYINTERFACE iid=" + iid.ToString("B"));
-
-            try
-            {
-                Type interfaceType = null;
-                if (iid == typeof(IWTSPlugin).GUID)
-                    interfaceType = typeof(IWTSPlugin);
-                else if (iid == typeof(IWTSListenerCallback).GUID)
-                    interfaceType = typeof(IWTSListenerCallback);
-                else if (iid == typeof(IWTSVirtualChannelCallback).GUID)
-                    interfaceType = typeof(IWTSVirtualChannelCallback);
-
-                if (interfaceType == null)
-                {
-                    PluginPipeClient.Trace("QUERYINTERFACE not-handled iid=" + iid.ToString("B"));
-                    return CustomQueryInterfaceResult.NotHandled;
-                }
-
-                ppv = Marshal.GetComInterfaceForObject(this, interfaceType, CustomQueryInterfaceMode.Ignore);
-                if (ppv == IntPtr.Zero)
-                {
-                    PluginPipeClient.Trace("QUERYINTERFACE failed iid=" + iid.ToString("B") + " ptr=null");
-                    return CustomQueryInterfaceResult.Failed;
-                }
-
-                PluginPipeClient.Trace("QUERYINTERFACE handled iid=" + iid.ToString("B") + " ptr=0x" + ppv.ToInt64().ToString("X"));
-                return CustomQueryInterfaceResult.Handled;
-            }
-            catch (Exception ex)
-            {
-                PluginPipeClient.Trace("QUERYINTERFACE exception iid=" + iid.ToString("B") + " " + ex.GetType().FullName + ": " + ex.Message);
-                ppv = IntPtr.Zero;
-                return CustomQueryInterfaceResult.Failed;
-            }
+            PluginPipeClient.Trace("CCW mode: ClassInterface=None, default=IWTSPlugin");
         }
 
         public int Initialize(IWTSVirtualChannelManager channelManager)
         {
-            if (channelManager == null) return E_FAIL;
+            PluginPipeClient.Trace("IWTSPlugin.Initialize ENTER");
+            if (channelManager == null)
+            {
+                PluginPipeClient.Trace("IWTSPlugin.Initialize channelManager=null");
+                return E_FAIL;
+            }
+
             try
             {
                 _pipe.SendStatus("IWTSPlugin.Initialize called");
                 int hr = channelManager.CreateListener(ChannelName, 0, this, out _listener);
                 _pipe.SendStatus(hr == S_OK ? "DVC listener created: " + ChannelName : "CreateListener failed: 0x" + hr.ToString("X8"));
+                PluginPipeClient.Trace("IWTSPlugin.Initialize EXIT hr=0x" + hr.ToString("X8"));
                 return hr;
             }
             catch (Exception ex)
             {
+                PluginPipeClient.Trace("IWTSPlugin.Initialize EXCEPTION " + ex);
                 _pipe.SendStatus("Initialize failed: " + ex.Message);
                 return E_FAIL;
             }
@@ -100,12 +70,14 @@ namespace Rdptun.Plugin
 
         public int Connected()
         {
+            PluginPipeClient.Trace("IWTSPlugin.Connected ENTER");
             _pipe.SendStatus("RDP client reports Connected");
             return S_OK;
         }
 
         public int Disconnected(uint disconnectCode)
         {
+            PluginPipeClient.Trace("IWTSPlugin.Disconnected code=0x" + disconnectCode.ToString("X8"));
             lock (_channelLock) _channel = null;
             _pipe.SendStatus("RDP disconnected: 0x" + disconnectCode.ToString("X8"));
             _pipe.SendDvcClosed();
@@ -114,6 +86,7 @@ namespace Rdptun.Plugin
 
         public int Terminated()
         {
+            PluginPipeClient.Trace("IWTSPlugin.Terminated ENTER");
             lock (_channelLock) _channel = null;
             _pipe.SendStatus("DVC plugin terminated");
             _pipe.SendDvcClosed();
@@ -124,6 +97,7 @@ namespace Rdptun.Plugin
 
         public int OnNewChannelConnection(IWTSVirtualChannel channel, string data, out bool accept, out IWTSVirtualChannelCallback callback)
         {
+            PluginPipeClient.Trace("IWTSListenerCallback.OnNewChannelConnection ENTER");
             accept = true;
             callback = this;
             lock (_channelLock) _channel = channel;
@@ -179,6 +153,7 @@ namespace Rdptun.Plugin
 
         public int OnClose()
         {
+            PluginPipeClient.Trace("IWTSVirtualChannelCallback.OnClose ENTER");
             lock (_channelLock) _channel = null;
             _pipe.SendStatus("DVC rdptun closed");
             _pipe.SendDvcClosed();
