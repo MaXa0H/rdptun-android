@@ -3,7 +3,6 @@
 #include <tsvirtualchannels.h>
 
 #include <atomic>
-#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -12,6 +11,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#pragma comment(linker, "/EXPORT:DllGetClassObject")
+#pragma comment(linker, "/EXPORT:DllCanUnloadNow")
 
 namespace
 {
@@ -31,12 +33,10 @@ namespace
     std::wstring GetEnv(const wchar_t* name)
     {
         DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
-        if (needed == 0)
-            return {};
+        if (!needed) return {};
         std::wstring value(needed, L'\0');
         DWORD written = GetEnvironmentVariableW(name, value.data(), needed);
-        if (written == 0)
-            return {};
+        if (!written) return {};
         value.resize(written);
         return value;
     }
@@ -44,8 +44,7 @@ namespace
     std::wstring GetTracePath()
     {
         std::wstring value = GetEnv(L"RDPTUN_TRACE");
-        if (!value.empty())
-            return value;
+        if (!value.empty()) return value;
         wchar_t tmp[MAX_PATH]{};
         GetTempPathW(MAX_PATH, tmp);
         return std::wstring(tmp) + L"rdptun-inproc-plugin.log";
@@ -60,19 +59,24 @@ namespace
     std::wstring GuidString(REFGUID guid)
     {
         wchar_t buffer[64]{};
-        if (StringFromGUID2(guid, buffer, _countof(buffer)) <= 0)
-            return L"{}";
-        return buffer;
+        return StringFromGUID2(guid, buffer, _countof(buffer)) > 0 ? std::wstring(buffer) : L"{}";
     }
 
     std::string WideToUtf8(const std::wstring& text)
     {
         if (text.empty()) return {};
-        int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
-        if (n <= 0) return {};
-        std::string result(static_cast<size_t>(n), '\0');
-        WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), result.data(), n, nullptr, nullptr);
+        int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+        if (size <= 0) return {};
+        std::string result(static_cast<size_t>(size), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), result.data(), size, nullptr, nullptr);
         return result;
+    }
+
+    std::string HexHr(HRESULT hr)
+    {
+        char buffer[16]{};
+        std::snprintf(buffer, sizeof(buffer), "%08lX", static_cast<unsigned long>(hr));
+        return buffer;
     }
 
     void Trace(const std::string& text)
@@ -84,31 +88,21 @@ namespace
         std::snprintf(prefix, sizeof(prefix), "%02u:%02u:%02u.%03u pid=%lu ",
             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, GetCurrentProcessId());
         std::string line = std::string(prefix) + text + "\r\n";
-
         HANDLE file = CreateFileW(GetTracePath().c_str(), FILE_APPEND_DATA,
             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file == INVALID_HANDLE_VALUE)
-            return;
+        if (file == INVALID_HANDLE_VALUE) return;
         DWORD written = 0;
         WriteFile(file, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
         CloseHandle(file);
     }
 
-    std::string HexHr(HRESULT hr)
-    {
-        char buffer[16]{};
-        std::snprintf(buffer, sizeof(buffer), "%08lX", static_cast<unsigned long>(hr));
-        return buffer;
-    }
-
     bool WriteAll(HANDLE handle, const void* data, DWORD size)
     {
         const BYTE* cursor = static_cast<const BYTE*>(data);
-        while (size > 0)
+        while (size)
         {
             DWORD written = 0;
-            if (!WriteFile(handle, cursor, size, &written, nullptr) || written == 0)
-                return false;
+            if (!WriteFile(handle, cursor, size, &written, nullptr) || !written) return false;
             cursor += written;
             size -= written;
         }
@@ -118,11 +112,10 @@ namespace
     bool ReadAll(HANDLE handle, void* data, DWORD size)
     {
         BYTE* cursor = static_cast<BYTE*>(data);
-        while (size > 0)
+        while (size)
         {
             DWORD read = 0;
-            if (!ReadFile(handle, cursor, size, &read, nullptr) || read == 0)
-                return false;
+            if (!ReadFile(handle, cursor, size, &read, nullptr) || !read) return false;
             cursor += read;
             size -= read;
         }
@@ -134,37 +127,25 @@ namespace
     public:
         using PacketHandler = std::function<void(const std::vector<BYTE>&)>;
 
-        explicit PipeClient(PacketHandler packetHandler)
-            : m_packetHandler(std::move(packetHandler))
-        {
-        }
-
-        ~PipeClient()
-        {
-            Stop();
-        }
+        explicit PipeClient(PacketHandler handler) : m_packetHandler(std::move(handler)) {}
+        ~PipeClient() { Stop(); }
 
         void Start()
         {
-            if (m_running.exchange(true))
-                return;
+            if (m_running.exchange(true)) return;
             Trace("INPROC PipeClient.Start pipe=" + WideToUtf8(GetPipeName()));
             m_thread = std::thread([this] { Run(); });
         }
 
         void Stop()
         {
-            if (!m_running.exchange(false))
-                return;
-
+            if (!m_running.exchange(false)) return;
             HANDLE pipe = INVALID_HANDLE_VALUE;
             {
                 std::lock_guard<std::mutex> lock(m_pipeMutex);
                 pipe = m_pipe;
             }
-            if (pipe != INVALID_HANDLE_VALUE)
-                CancelIoEx(pipe, nullptr);
-
+            if (pipe != INVALID_HANDLE_VALUE) CancelIoEx(pipe, nullptr);
             if (m_thread.joinable())
             {
                 CancelSynchronousIo(static_cast<HANDLE>(m_thread.native_handle()));
@@ -175,27 +156,16 @@ namespace
         void SendStatus(const std::string& text)
         {
             Trace("STATUS " + text);
-            std::vector<BYTE> payload(text.begin(), text.end());
-            SendFrame(FrameStatus, payload);
+            SendFrame(FrameStatus, std::vector<BYTE>(text.begin(), text.end()));
         }
 
         void SendPacketFromDvc(const BYTE* data, size_t size)
         {
-            std::vector<BYTE> payload(data, data + size);
-            SendFrame(FramePacketFromDvc, payload);
+            SendFrame(FramePacketFromDvc, std::vector<BYTE>(data, data + size));
         }
 
-        void SendDvcOpened()
-        {
-            Trace("DVC OPENED");
-            SendFrame(FrameDvcOpened, {});
-        }
-
-        void SendDvcClosed()
-        {
-            Trace("DVC CLOSED");
-            SendFrame(FrameDvcClosed, {});
-        }
+        void SendDvcOpened() { Trace("DVC OPENED"); SendFrame(FrameDvcOpened, {}); }
+        void SendDvcClosed() { Trace("DVC CLOSED"); SendFrame(FrameDvcClosed, {}); }
 
     private:
         void Run()
@@ -211,7 +181,6 @@ namespace
                     WaitNamedPipeW(fullPipe.c_str(), 500);
                     continue;
                 }
-
                 {
                     std::lock_guard<std::mutex> lock(m_pipeMutex);
                     m_pipe = pipe;
@@ -222,63 +191,41 @@ namespace
                 while (m_running.load())
                 {
                     BYTE header[5]{};
-                    if (!ReadAll(pipe, header, sizeof(header)))
-                        break;
-
+                    if (!ReadAll(pipe, header, sizeof(header))) break;
                     DWORD length = static_cast<DWORD>(header[1]) |
                         (static_cast<DWORD>(header[2]) << 8) |
                         (static_cast<DWORD>(header[3]) << 16) |
                         (static_cast<DWORD>(header[4]) << 24);
-                    if (length > MaxPipeFrame)
-                    {
-                        Trace("IPC invalid frame length=" + std::to_string(length));
-                        break;
-                    }
-
+                    if (length > MaxPipeFrame) break;
                     std::vector<BYTE> payload(length);
-                    if (length != 0 && !ReadAll(pipe, payload.data(), length))
-                        break;
-                    if (header[0] == FramePacketToDvc && m_packetHandler)
-                        m_packetHandler(payload);
+                    if (length && !ReadAll(pipe, payload.data(), length)) break;
+                    if (header[0] == FramePacketToDvc && m_packetHandler) m_packetHandler(payload);
                 }
 
                 {
                     std::lock_guard<std::mutex> lock(m_pipeMutex);
-                    if (m_pipe == pipe)
-                        m_pipe = INVALID_HANDLE_VALUE;
+                    if (m_pipe == pipe) m_pipe = INVALID_HANDLE_VALUE;
                 }
                 CloseHandle(pipe);
-                if (m_running.load())
-                    Sleep(250);
+                if (m_running.load()) Sleep(250);
             }
         }
 
         void SendFrame(BYTE type, const std::vector<BYTE>& payload)
         {
-            if (payload.size() > MaxPipeFrame)
-                return;
-
+            if (payload.size() > MaxPipeFrame) return;
             std::lock_guard<std::mutex> writeLock(m_writeMutex);
             HANDLE pipe = INVALID_HANDLE_VALUE;
             {
                 std::lock_guard<std::mutex> lock(m_pipeMutex);
                 pipe = m_pipe;
             }
-            if (pipe == INVALID_HANDLE_VALUE)
-                return;
-
+            if (pipe == INVALID_HANDLE_VALUE) return;
             DWORD length = static_cast<DWORD>(payload.size());
-            BYTE header[5]{
-                type,
-                static_cast<BYTE>(length),
-                static_cast<BYTE>(length >> 8),
-                static_cast<BYTE>(length >> 16),
-                static_cast<BYTE>(length >> 24)
-            };
-            if (!WriteAll(pipe, header, sizeof(header)))
-                return;
-            if (length != 0)
-                WriteAll(pipe, payload.data(), length);
+            BYTE header[5]{ type, static_cast<BYTE>(length), static_cast<BYTE>(length >> 8),
+                static_cast<BYTE>(length >> 16), static_cast<BYTE>(length >> 24) };
+            if (!WriteAll(pipe, header, sizeof(header))) return;
+            if (length) WriteAll(pipe, payload.data(), length);
         }
 
         std::atomic<bool> m_running{ false };
@@ -292,8 +239,7 @@ namespace
     class RdpPlugin final : public IWTSPlugin, public IWTSListenerCallback, public IWTSVirtualChannelCallback
     {
     public:
-        RdpPlugin()
-            : m_pipe([this](const std::vector<BYTE>& packet) { SendPacketToDvc(packet); })
+        RdpPlugin() : m_pipe([this](const std::vector<BYTE>& packet) { SendPacketToDvc(packet); })
         {
             InterlockedIncrement(&g_objectCount);
             Trace("INPROC RdpPlugin constructed");
@@ -316,7 +262,6 @@ namespace
             if (!ppvObject) return E_POINTER;
             *ppvObject = nullptr;
             Trace("INPROC QI iid=" + WideToUtf8(GuidString(riid)));
-
             if (riid == IID_IUnknown || riid == __uuidof(IWTSPlugin))
                 *ppvObject = static_cast<IWTSPlugin*>(this);
             else if (riid == __uuidof(IWTSListenerCallback))
@@ -325,46 +270,31 @@ namespace
                 *ppvObject = static_cast<IWTSVirtualChannelCallback*>(this);
             else
                 return E_NOINTERFACE;
-
             AddRef();
             return S_OK;
         }
 
-        ULONG STDMETHODCALLTYPE AddRef() override
-        {
-            return static_cast<ULONG>(InterlockedIncrement(&m_refCount));
-        }
-
+        ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&m_refCount)); }
         ULONG STDMETHODCALLTYPE Release() override
         {
             ULONG value = static_cast<ULONG>(InterlockedDecrement(&m_refCount));
-            if (value == 0)
-                delete this;
+            if (!value) delete this;
             return value;
         }
 
-        HRESULT STDMETHODCALLTYPE Initialize(IWTSVirtualChannelManager* channelManager) override
+        HRESULT STDMETHODCALLTYPE Initialize(IWTSVirtualChannelManager* manager) override
         {
             Trace("IWTSPlugin.Initialize ENTER (native in-proc)");
             m_pipe.SendStatus("IWTSPlugin.Initialize called (native in-proc)");
-            if (!channelManager)
-                return E_POINTER;
-
-            if (m_manager) { m_manager->Release(); m_manager = nullptr; }
-            m_manager = channelManager;
+            if (!manager) return E_POINTER;
+            if (m_manager) m_manager->Release();
+            m_manager = manager;
             m_manager->AddRef();
-
             if (m_listener) { m_listener->Release(); m_listener = nullptr; }
-            HRESULT hr = m_manager->CreateListener(
-                const_cast<LPSTR>(ChannelName),
-                0,
-                static_cast<IWTSListenerCallback*>(this),
-                &m_listener);
-
-            if (SUCCEEDED(hr))
-                m_pipe.SendStatus("DVC listener created: rdptun (native in-proc)");
-            else
-                m_pipe.SendStatus("CreateListener failed (native in-proc): 0x" + HexHr(hr));
+            HRESULT hr = m_manager->CreateListener(const_cast<LPSTR>(ChannelName), 0,
+                static_cast<IWTSListenerCallback*>(this), &m_listener);
+            m_pipe.SendStatus(SUCCEEDED(hr) ? "DVC listener created: rdptun (native in-proc)" :
+                "CreateListener failed (native in-proc): 0x" + HexHr(hr));
             return hr;
         }
 
@@ -374,10 +304,10 @@ namespace
             return S_OK;
         }
 
-        HRESULT STDMETHODCALLTYPE Disconnected(DWORD disconnectCode) override
+        HRESULT STDMETHODCALLTYPE Disconnected(DWORD code) override
         {
             ClearChannel();
-            m_pipe.SendStatus("RDP disconnected (native in-proc): 0x" + HexHr(static_cast<HRESULT>(disconnectCode)));
+            m_pipe.SendStatus("RDP disconnected (native in-proc): 0x" + HexHr(static_cast<HRESULT>(code)));
             m_pipe.SendDvcClosed();
             return S_OK;
         }
@@ -390,15 +320,10 @@ namespace
             return S_OK;
         }
 
-        HRESULT STDMETHODCALLTYPE OnNewChannelConnection(
-            IWTSVirtualChannel* channel,
-            BSTR,
-            BOOL* accept,
-            IWTSVirtualChannelCallback** callback) override
+        HRESULT STDMETHODCALLTYPE OnNewChannelConnection(IWTSVirtualChannel* channel, BSTR,
+            BOOL* accept, IWTSVirtualChannelCallback** callback) override
         {
-            if (!channel || !accept || !callback)
-                return E_POINTER;
-
+            if (!channel || !accept || !callback) return E_POINTER;
             {
                 std::lock_guard<std::mutex> lock(m_channelMutex);
                 if (m_channel) m_channel->Release();
@@ -409,11 +334,9 @@ namespace
                 std::lock_guard<std::mutex> lock(m_rxMutex);
                 m_rx.clear();
             }
-
             *accept = TRUE;
             *callback = static_cast<IWTSVirtualChannelCallback*>(this);
             AddRef();
-
             m_pipe.SendStatus("DVC rdptun opened (native in-proc)");
             m_pipe.SendDvcOpened();
             return S_OK;
@@ -421,37 +344,28 @@ namespace
 
         HRESULT STDMETHODCALLTYPE OnDataReceived(ULONG size, BYTE* buffer) override
         {
-            if (size == 0 || !buffer)
-                return S_OK;
-
+            if (!size || !buffer) return S_OK;
             std::lock_guard<std::mutex> lock(m_rxMutex);
             if (m_rx.size() + size > 65536)
             {
                 m_rx.clear();
-                m_pipe.SendStatus("DVC RX buffer overflow (native in-proc)");
                 return E_FAIL;
             }
             m_rx.insert(m_rx.end(), buffer, buffer + size);
-
             size_t offset = 0;
             while (m_rx.size() - offset >= 2)
             {
                 size_t length = (static_cast<size_t>(m_rx[offset]) << 8) | m_rx[offset + 1];
-                if (length == 0 || length > MaxDvcPacket)
+                if (!length || length > MaxDvcPacket)
                 {
                     m_rx.clear();
-                    m_pipe.SendStatus("Invalid DVC packet length (native in-proc): " + std::to_string(length));
                     return E_FAIL;
                 }
-                if (m_rx.size() - offset < length + 2)
-                    break;
-
+                if (m_rx.size() - offset < length + 2) break;
                 m_pipe.SendPacketFromDvc(m_rx.data() + offset + 2, length);
                 offset += length + 2;
             }
-
-            if (offset > 0)
-                m_rx.erase(m_rx.begin(), m_rx.begin() + static_cast<ptrdiff_t>(offset));
+            if (offset) m_rx.erase(m_rx.begin(), m_rx.begin() + static_cast<ptrdiff_t>(offset));
             return S_OK;
         }
 
@@ -467,36 +381,26 @@ namespace
         void ClearChannel()
         {
             std::lock_guard<std::mutex> lock(m_channelMutex);
-            if (m_channel)
-            {
-                m_channel->Release();
-                m_channel = nullptr;
-            }
+            if (m_channel) { m_channel->Release(); m_channel = nullptr; }
         }
 
         void SendPacketToDvc(const std::vector<BYTE>& packet)
         {
-            if (packet.empty() || packet.size() > MaxDvcPacket || ((packet[0] >> 4) != 4))
-                return;
-
+            if (packet.empty() || packet.size() > MaxDvcPacket || (packet[0] >> 4) != 4) return;
             IWTSVirtualChannel* channel = nullptr;
             {
                 std::lock_guard<std::mutex> lock(m_channelMutex);
                 channel = m_channel;
                 if (channel) channel->AddRef();
             }
-            if (!channel)
-                return;
-
+            if (!channel) return;
             std::vector<BYTE> frame(packet.size() + 2);
             frame[0] = static_cast<BYTE>(packet.size() >> 8);
             frame[1] = static_cast<BYTE>(packet.size());
             std::memcpy(frame.data() + 2, packet.data(), packet.size());
-
             HRESULT hr = channel->Write(static_cast<ULONG>(frame.size()), frame.data(), nullptr);
             channel->Release();
-            if (FAILED(hr))
-                m_pipe.SendStatus("DVC Write failed (native in-proc): 0x" + HexHr(hr));
+            if (FAILED(hr)) m_pipe.SendStatus("DVC Write failed (native in-proc): 0x" + HexHr(hr));
         }
 
         volatile LONG m_refCount = 1;
@@ -512,39 +416,24 @@ namespace
     class ClassFactory final : public IClassFactory
     {
     public:
-        ClassFactory()
-        {
-            InterlockedIncrement(&g_objectCount);
-            Trace("INPROC ClassFactory constructed");
-        }
-
-        ~ClassFactory()
-        {
-            Trace("INPROC ClassFactory destroyed");
-            InterlockedDecrement(&g_objectCount);
-        }
+        ClassFactory() { InterlockedIncrement(&g_objectCount); Trace("INPROC ClassFactory constructed"); }
+        ~ClassFactory() { Trace("INPROC ClassFactory destroyed"); InterlockedDecrement(&g_objectCount); }
 
         HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override
         {
             if (!ppvObject) return E_POINTER;
             *ppvObject = nullptr;
-            if (riid != IID_IUnknown && riid != IID_IClassFactory)
-                return E_NOINTERFACE;
+            if (riid != IID_IUnknown && riid != IID_IClassFactory) return E_NOINTERFACE;
             *ppvObject = static_cast<IClassFactory*>(this);
             AddRef();
             return S_OK;
         }
 
-        ULONG STDMETHODCALLTYPE AddRef() override
-        {
-            return static_cast<ULONG>(InterlockedIncrement(&m_refCount));
-        }
-
+        ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&m_refCount)); }
         ULONG STDMETHODCALLTYPE Release() override
         {
             ULONG value = static_cast<ULONG>(InterlockedDecrement(&m_refCount));
-            if (value == 0)
-                delete this;
+            if (!value) delete this;
             return value;
         }
 
@@ -554,7 +443,6 @@ namespace
             if (!ppvObject) return E_POINTER;
             *ppvObject = nullptr;
             if (outer) return CLASS_E_NOAGGREGATION;
-
             RdpPlugin* plugin = new (std::nothrow) RdpPlugin();
             if (!plugin) return E_OUTOFMEMORY;
             HRESULT hr = plugin->QueryInterface(riid, ppvObject);
@@ -565,10 +453,8 @@ namespace
 
         HRESULT STDMETHODCALLTYPE LockServer(BOOL lock) override
         {
-            if (lock)
-                InterlockedIncrement(&g_serverLocks);
-            else
-                InterlockedDecrement(&g_serverLocks);
+            if (lock) InterlockedIncrement(&g_serverLocks);
+            else InterlockedDecrement(&g_serverLocks);
             return S_OK;
         }
 
@@ -577,17 +463,11 @@ namespace
     };
 }
 
-extern "C" __declspec(dllexport) HRESULT __stdcall DllGetClassObject(
-    REFCLSID rclsid,
-    REFIID riid,
-    LPVOID* ppv)
+STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv)
 {
-    Trace("DllGetClassObject clsid=" + WideToUtf8(GuidString(rclsid)) +
-        " riid=" + WideToUtf8(GuidString(riid)));
-
+    Trace("DllGetClassObject clsid=" + WideToUtf8(GuidString(rclsid)) + " riid=" + WideToUtf8(GuidString(riid)));
     if (!ppv) return E_POINTER;
     *ppv = nullptr;
-
     ClassFactory* factory = new (std::nothrow) ClassFactory();
     if (!factory) return E_OUTOFMEMORY;
     HRESULT hr = factory->QueryInterface(riid, ppv);
@@ -596,16 +476,13 @@ extern "C" __declspec(dllexport) HRESULT __stdcall DllGetClassObject(
     return hr;
 }
 
-extern "C" __declspec(dllexport) HRESULT __stdcall DllCanUnloadNow()
+STDAPI DllCanUnloadNow()
 {
     return (g_objectCount == 0 && g_serverLocks == 0) ? S_OK : S_FALSE;
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
 {
-    if (reason == DLL_PROCESS_ATTACH)
-    {
-        DisableThreadLibraryCalls(instance);
-    }
+    if (reason == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(instance);
     return TRUE;
 }
