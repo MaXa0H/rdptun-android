@@ -1,5 +1,9 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <objbase.h>
 #include <tsvirtualchannels.h>
@@ -292,7 +296,7 @@ namespace
             Trace("NATIVE COM object constructed");
         }
 
-        ~RdpPlugin() override
+        ~RdpPlugin()
         {
             Trace("NATIVE COM object destroyed");
             ClearChannel();
