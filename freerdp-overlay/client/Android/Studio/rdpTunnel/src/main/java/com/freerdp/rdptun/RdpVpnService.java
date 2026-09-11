@@ -6,7 +6,6 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
-import android.net.IpPrefix;
 import android.net.Uri;
 import android.net.VpnService;
 import android.os.Build;
@@ -154,7 +153,10 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
                 .addDnsServer("1.1.1.1")
                 .setBlocking(true);
 
-        b.excludeRoute(new IpPrefix(InetAddress.getByName(serverIpv4), 32));
+        // Android 12 / API 31 does not have Builder.excludeRoute().
+        // Keep this app itself outside the VPN so the underlying RDP TCP socket
+        // continues to use the physical network and cannot loop back into TUN.
+        b.addDisallowedApplication(getPackageName());
 
         ParcelFileDescriptor pfd = b.establish();
         if (pfd == null)
