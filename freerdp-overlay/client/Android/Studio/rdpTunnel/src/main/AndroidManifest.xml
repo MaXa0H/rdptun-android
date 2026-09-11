@@ -23,6 +23,7 @@
 
         <service
             android:name=".RdpVpnService"
+            android:process=":vpn"
             android:exported="false"
             android:foregroundServiceType="specialUse"
             android:permission="android.permission.BIND_VPN_SERVICE">
