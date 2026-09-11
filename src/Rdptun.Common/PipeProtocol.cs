@@ -27,8 +27,28 @@ namespace Rdptun.Common
 
     public static class PipeProtocol
     {
-        public const string PipeName = "rdptun-control";
+        private const string DefaultPipeName = "rdptun-control";
         private const int MaxFrame = 1024 * 1024;
+
+        public static string PipeName
+        {
+            get
+            {
+                string value = Environment.GetEnvironmentVariable("RDPTUN_PIPE");
+                return string.IsNullOrWhiteSpace(value) ? DefaultPipeName : value;
+            }
+        }
+
+        public static string TracePath
+        {
+            get
+            {
+                string value = Environment.GetEnvironmentVariable("RDPTUN_TRACE");
+                if (!string.IsNullOrWhiteSpace(value))
+                    return value;
+                return Path.Combine(Path.GetTempPath(), "rdptun-plugin.log");
+            }
+        }
 
         public static PipeFrame ReadFrame(Stream stream)
         {
