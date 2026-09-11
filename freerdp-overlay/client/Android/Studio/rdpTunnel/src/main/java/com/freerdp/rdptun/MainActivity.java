@@ -1,7 +1,11 @@
 package com.freerdp.rdptun;
 
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.net.VpnService;
+import android.os.Build;
 import android.os.Bundle;
 import android.widget.Button;
 import android.widget.EditText;
@@ -26,6 +30,17 @@ public class MainActivity extends AppCompatActivity {
     private String pendingUser;
     private String pendingPassword;
 
+    private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!RdpVpnService.ACTION_STATUS.equals(intent.getAction()))
+                return;
+            String text = intent.getStringExtra(RdpVpnService.EXTRA_STATUS);
+            if (text != null)
+                status.setText(text);
+        }
+    };
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -49,6 +64,22 @@ public class MainActivity extends AppCompatActivity {
             startService(i);
             status.setText("Disconnected");
         });
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        IntentFilter filter = new IntentFilter(RdpVpnService.ACTION_STATUS);
+        if (Build.VERSION.SDK_INT >= 33)
+            registerReceiver(statusReceiver, filter, RECEIVER_NOT_EXPORTED);
+        else
+            registerReceiver(statusReceiver, filter);
+    }
+
+    @Override
+    protected void onStop() {
+        try { unregisterReceiver(statusReceiver); } catch (IllegalArgumentException ignored) {}
+        super.onStop();
     }
 
     private void requestConnect() {
@@ -99,6 +130,6 @@ public class MainActivity extends AppCompatActivity {
         i.putExtra(RdpVpnService.EXTRA_USER, pendingUser);
         i.putExtra(RdpVpnService.EXTRA_PASSWORD, pendingPassword);
         ContextCompat.startForegroundService(this, i);
-        status.setText("Connecting RDP…");
+        status.setText("Starting VPN service…");
     }
 }
