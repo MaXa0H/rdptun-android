@@ -45,15 +45,15 @@ namespace Rdptun.App
         public void Launch(string serverIp, int port, string username, string password, Action<string> log)
         {
             _disposed = false;
+            string pluginTrace = Path.Combine(Path.GetTempPath(), "rdptun-plugin.log");
+            try { File.Delete(pluginTrace); } catch { }
+
             _credentialTarget = "TERMSRV/" + serverIp;
             RunCmdKey("/generic:" + _credentialTarget + " /user:\"" + username + "\" /pass:\"" + password.Replace("\"", "\\\"") + "\"");
 
             _rdpFile = Path.Combine(Path.GetTempPath(), "rdptun-" + Guid.NewGuid().ToString("N") + ".rdp");
             string fullAddress = serverIp + (port == 3389 ? string.Empty : ":" + port);
 
-            // This is a real RDP session because DVC/drdynvc only exists inside RDP.
-            // Keep the graphical side deliberately tiny and feature-poor: the session is
-            // only a transport carrier for the rdptun DVC, not a user-facing desktop.
             StringBuilder rdp = new StringBuilder();
             rdp.AppendLine("screen mode id:i:1");
             rdp.AppendLine("desktopwidth:i:320");
@@ -64,8 +64,6 @@ namespace Rdptun.App
             rdp.AppendLine("prompt for credentials on client:i:0");
             rdp.AppendLine("authentication level:i:0");
             rdp.AppendLine("enablecredsspsupport:i:1");
-
-            // Minimise non-DVC traffic and redirections.
             rdp.AppendLine("connection type:i:1");
             rdp.AppendLine("networkautodetect:i:0");
             rdp.AppendLine("bandwidthautodetect:i:0");
@@ -81,7 +79,6 @@ namespace Rdptun.App
             rdp.AppendLine("smart sizing:i:0");
             rdp.AppendLine("use multimon:i:0");
             rdp.AppendLine("videoplaybackmode:i:0");
-
             rdp.AppendLine("redirectclipboard:i:0");
             rdp.AppendLine("redirectprinters:i:0");
             rdp.AppendLine("redirectcomports:i:0");
@@ -113,12 +110,42 @@ namespace Rdptun.App
                 if (handler != null) handler();
             };
 
-            // mstsc creates/recreates its top-level window during negotiation. Keep hiding
-            // it for the lifetime of the transport so no remote desktop UI is presented.
             Task.Run(() => HideWindowLoop(log));
+            Task.Run(() => PluginActivationDiagnostic(pluginTrace, log));
 
             if (log != null)
                 log("Headless RDP transport started for " + fullAddress + "; waiting for rdptun DVC");
+        }
+
+        private void PluginActivationDiagnostic(string tracePath, Action<string> log)
+        {
+            for (int i = 0; i < 24 && !_disposed; i++)
+            {
+                Thread.Sleep(250);
+                try
+                {
+                    if (File.Exists(tracePath))
+                    {
+                        string text = File.ReadAllText(tracePath).Trim();
+                        if (log != null)
+                        {
+                            log("DVC plugin process was activated by mstsc");
+                            if (!string.IsNullOrEmpty(text))
+                            {
+                                string[] lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                                int start = Math.Max(0, lines.Length - 4);
+                                for (int n = start; n < lines.Length; n++)
+                                    log("PLUGIN TRACE: " + lines[n]);
+                            }
+                        }
+                        return;
+                    }
+                }
+                catch { }
+            }
+
+            if (!_disposed && log != null)
+                log("DIAGNOSTIC: mstsc did not activate Rdptun.Plugin within 6 seconds");
         }
 
         private void HideWindowLoop(Action<string> log)
@@ -195,7 +222,6 @@ namespace Rdptun.App
             {
                 if (_mstsc != null && !_mstsc.HasExited)
                 {
-                    // Hidden mstsc has no useful UI to close; terminate the carrier process.
                     _mstsc.Kill();
                     _mstsc.WaitForExit(2000);
                 }
