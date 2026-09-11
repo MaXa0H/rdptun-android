@@ -11,9 +11,13 @@ Windows x64 MVP for tunnelling IPv4 packets through a real Microsoft RDP Dynamic
 
 The client plug-in uses the Microsoft `IWTSPlugin` / `IWTSVirtualChannel*` DVC interfaces. The COM LocalServer pattern is based on Microsoft's official RDP DVC .NET Framework sample.
 
+The Microsoft RDP client is used only as a **hidden carrier session** for the DVC. No remote desktop window is intentionally presented to the user. The generated RDP profile uses a tiny 320x240 / 16-bpp surface and disables wallpaper, themes, animations, audio, clipboard, printers, drives, smart cards and other redirections to minimise non-DVC traffic.
+
+This is still a real RDP session: DVC/drdynvc does not exist independently of the host RDP connection. The VPN packets are carried as application data inside that real RDP Dynamic Virtual Channel.
+
 ## Wire protocol
 
-The RDP DVC payload is unchanged from the original MVP:
+The RDP DVC payload is:
 
 ```
 [2-byte big-endian packet length][raw IPv4 packet]
@@ -37,11 +41,9 @@ MTU: `1200`
 2. Run `Rdptun.exe`.
 3. Enter server, port, username and password.
 4. Click **Connect**.
-5. The app registers `Rdptun.Plugin.exe` per-user, stores the RDP credential temporarily with `cmdkey`, and launches Microsoft's `mstsc.exe`.
+5. The app registers `Rdptun.Plugin.exe` per-user, stores the RDP credential temporarily with `cmdkey`, and starts Microsoft's RDP client as a hidden transport carrier.
 6. When the server opens DVC `rdptun`, the app creates/configures Wintun, adds a host route that keeps the outer RDP connection on the physical interface, and adds the IPv4 default route through `10.77.0.1`.
-7. Click **Disconnect** to remove routes/firewall rules, stop Wintun and close the RDP client.
-
-The RDP window is intentionally visible in this MVP so authentication/certificate problems are easy to diagnose.
+7. Click **Disconnect** to remove routes/firewall rules, stop Wintun and terminate the hidden RDP carrier.
 
 ## IPv6
 
@@ -71,6 +73,7 @@ wintun.dll
 - The password is not written into this repository or an app settings file. For RDP launch, Windows `cmdkey.exe` is used and the credential is deleted on disconnect/process exit.
 - `authentication level:i:0` is used in the generated RDP file for MVP testing. For production, use certificate validation/pinning appropriate for your deployment.
 - Wintun is a third-party component downloaded from its official distribution during CI. Review its upstream licensing before redistribution.
+- Because this is a genuine RDP/DVC session, it should be described as VPN traffic transported inside RDP, not as being indistinguishable from every ordinary interactive RDP session. Protocol-aware inspection can still observe RDP/DVC characteristics.
 
 ## Third-party reference
 
