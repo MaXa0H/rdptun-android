@@ -5,8 +5,9 @@ namespace Rdptun.Plugin
 {
     [ComVisible(true)]
     [Guid("41F85E29-DFE2-45F9-B3F4-C5F646FA8F73")]
-    [ComDefaultInterface(typeof(RdpPlugin))]
-    public sealed class RdpPlugin : IWTSPlugin, IWTSListenerCallback, IWTSVirtualChannelCallback
+    [ClassInterface(ClassInterfaceType.None)]
+    [ComDefaultInterface(typeof(IWTSPlugin))]
+    public sealed class RdpPlugin : IWTSPlugin, IWTSListenerCallback, IWTSVirtualChannelCallback, ICustomQueryInterface
     {
         private const string ChannelName = "rdptun";
         private const int MaxPacket = 4096;
@@ -39,6 +40,45 @@ namespace Rdptun.Plugin
             _pipe.PacketToDvc += SendPacketToDvc;
             _pipe.Start();
             _pipe.SendStatus("RDP DVC plugin object created; clsid=" + PluginClsid.ToString("B"));
+        }
+
+        public CustomQueryInterfaceResult GetInterface(ref Guid iid, out IntPtr ppv)
+        {
+            ppv = IntPtr.Zero;
+            PluginPipeClient.Trace("QUERYINTERFACE iid=" + iid.ToString("B"));
+
+            try
+            {
+                Type interfaceType = null;
+                if (iid == typeof(IWTSPlugin).GUID)
+                    interfaceType = typeof(IWTSPlugin);
+                else if (iid == typeof(IWTSListenerCallback).GUID)
+                    interfaceType = typeof(IWTSListenerCallback);
+                else if (iid == typeof(IWTSVirtualChannelCallback).GUID)
+                    interfaceType = typeof(IWTSVirtualChannelCallback);
+
+                if (interfaceType == null)
+                {
+                    PluginPipeClient.Trace("QUERYINTERFACE not-handled iid=" + iid.ToString("B"));
+                    return CustomQueryInterfaceResult.NotHandled;
+                }
+
+                ppv = Marshal.GetComInterfaceForObject(this, interfaceType, CustomQueryInterfaceMode.Ignore);
+                if (ppv == IntPtr.Zero)
+                {
+                    PluginPipeClient.Trace("QUERYINTERFACE failed iid=" + iid.ToString("B") + " ptr=null");
+                    return CustomQueryInterfaceResult.Failed;
+                }
+
+                PluginPipeClient.Trace("QUERYINTERFACE handled iid=" + iid.ToString("B") + " ptr=0x" + ppv.ToInt64().ToString("X"));
+                return CustomQueryInterfaceResult.Handled;
+            }
+            catch (Exception ex)
+            {
+                PluginPipeClient.Trace("QUERYINTERFACE exception iid=" + iid.ToString("B") + " " + ex.GetType().FullName + ": " + ex.Message);
+                ppv = IntPtr.Zero;
+                return CustomQueryInterfaceResult.Failed;
+            }
         }
 
         public int Initialize(IWTSVirtualChannelManager channelManager)
