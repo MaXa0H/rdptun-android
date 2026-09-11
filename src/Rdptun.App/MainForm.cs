@@ -71,7 +71,7 @@ namespace Rdptun.App
             {
                 Log("DVC rdptun closed");
                 StopTunnelOnly();
-                SetStatus("RDP connected, DVC closed");
+                SetStatus("RDP carrier connected, DVC closed");
             });
             _pipe.PacketFromDvc += packet =>
             {
@@ -116,7 +116,7 @@ namespace Rdptun.App
 
             _connect.Enabled = false;
             _disconnect.Enabled = true;
-            SetStatus("Preparing RDP...");
+            SetStatus("Preparing hidden RDP carrier...");
 
             Task.Run(() =>
             {
@@ -131,14 +131,14 @@ namespace Rdptun.App
                     _rdp = new RdpLauncher();
                     _rdp.Exited += () => BeginInvokeSafe(() =>
                     {
-                        Log("mstsc.exe exited");
+                        Log("RDP carrier exited");
                         StopTunnelOnly();
-                        SetStatus("RDP disconnected");
+                        SetStatus("Carrier disconnected");
                         _connect.Enabled = true;
                         _disconnect.Enabled = false;
                     });
                     _rdp.Launch(_serverIpv4, port, user, password, Log);
-                    SetStatus("RDP launched; waiting for DVC rdptun...");
+                    SetStatus("Hidden RDP carrier started; waiting for DVC rdptun...");
                 }
                 catch (Exception ex)
                 {
@@ -166,7 +166,7 @@ namespace Rdptun.App
                         TunnelManager tunnel = new TunnelManager(Log);
                         tunnel.Start(_serverIpv4, packet => _pipe.SendPacketToDvc(packet));
                         _tunnel = tunnel;
-                        SetStatus("Connected — IPv4 via RDP/DVC");
+                        SetStatus("Connected — IPv4 through RDP/DVC");
                     }
                     catch (Exception ex)
                     {
