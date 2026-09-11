@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Win32;
 using Rdptun.Common;
 
 namespace Rdptun.App
@@ -12,8 +13,6 @@ namespace Rdptun.App
     internal sealed class RdpLauncher : IDisposable
     {
         private Process _mstsc;
-        private static Process _pluginHost;
-        private static readonly object PluginHostLock = new object();
         private string _credentialTarget;
         private string _rdpFile;
         private volatile bool _disposed;
@@ -27,68 +26,47 @@ namespace Rdptun.App
 
         public static void EnsurePluginRegistered(string baseDir, Action<string> log)
         {
-            string plugin = Path.Combine(baseDir, "Rdptun.Plugin.exe");
+            string plugin = Path.Combine(baseDir, "Rdptun.Plugin.dll");
             if (!File.Exists(plugin))
-                throw new FileNotFoundException("Rdptun.Plugin.exe is missing", plugin);
+                throw new FileNotFoundException("Rdptun.Plugin.dll is missing", plugin);
 
-            ProcessStartInfo psi = new ProcessStartInfo(plugin, "/register")
+            string clsidText = Environment.GetEnvironmentVariable("RDPTUN_CLSID");
+            Guid clsid;
+            if (string.IsNullOrWhiteSpace(clsidText) || !Guid.TryParse(clsidText, out clsid))
+                throw new InvalidOperationException("RDPTUN_CLSID is missing or invalid");
+            clsidText = clsid.ToString("B");
+
+            string addInsPath = @"Software\Microsoft\Terminal Server Client\Default\AddIns\Rdptun";
+            string clsidPath = @"Software\Classes\CLSID\" + clsidText;
+            string inprocPath = clsidPath + @"\InprocServer32";
+            string localServerPath = clsidPath + @"\LocalServer32";
+
+            try { Registry.CurrentUser.DeleteSubKeyTree(localServerPath, false); } catch { }
+
+            using (RegistryKey addIn = Registry.CurrentUser.CreateSubKey(addInsPath))
             {
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-            using (Process p = Process.Start(psi))
-            {
-                p.WaitForExit();
-                if (p.ExitCode != 0)
-                    throw new InvalidOperationException("DVC plugin registration failed with exit code " + p.ExitCode);
+                if (addIn == null) throw new InvalidOperationException("Cannot create RDP AddIns registry key");
+                addIn.SetValue("Name", clsidText, RegistryValueKind.String);
             }
-            if (log != null) log("DVC COM plugin registered for current user");
-
-            lock (PluginHostLock)
+            using (RegistryKey clsidKey = Registry.CurrentUser.CreateSubKey(clsidPath))
             {
-                if (_pluginHost != null)
-                {
-                    try
-                    {
-                        if (_pluginHost.HasExited)
-                        {
-                            _pluginHost.Dispose();
-                            _pluginHost = null;
-                        }
-                    }
-                    catch
-                    {
-                        _pluginHost = null;
-                    }
-                }
+                if (clsidKey == null) throw new InvalidOperationException("Cannot create COM CLSID registry key");
+                clsidKey.SetValue(null, "RDP Tunnel DVC Plugin", RegistryValueKind.String);
+            }
+            using (RegistryKey inproc = Registry.CurrentUser.CreateSubKey(inprocPath))
+            {
+                if (inproc == null) throw new InvalidOperationException("Cannot create COM InprocServer32 registry key");
+                inproc.SetValue(null, plugin, RegistryValueKind.String);
+                inproc.SetValue("ThreadingModel", "Both", RegistryValueKind.String);
+            }
 
-                if (_pluginHost == null)
-                {
-                    try { File.Delete(PipeProtocol.TracePath); } catch { }
+            try { File.Delete(PipeProtocol.TracePath); } catch { }
 
-                    ProcessStartInfo hostPsi = new ProcessStartInfo(plugin)
-                    {
-                        UseShellExecute = false,
-                        CreateNoWindow = true,
-                        WorkingDirectory = baseDir
-                    };
-                    _pluginHost = Process.Start(hostPsi);
-                    if (_pluginHost == null)
-                        throw new InvalidOperationException("Could not pre-start DVC COM LocalServer");
-                    Thread.Sleep(500);
-                    if (_pluginHost.HasExited)
-                    {
-                        int code = _pluginHost.ExitCode;
-                        _pluginHost.Dispose();
-                        _pluginHost = null;
-                        throw new InvalidOperationException("DVC COM LocalServer exited early with code " + code);
-                    }
-                    if (log != null)
-                    {
-                        log("DVC COM LocalServer pre-started, pid=" + _pluginHost.Id);
-                        log("IPC session: " + PipeProtocol.PipeName);
-                    }
-                }
+            if (log != null)
+            {
+                log("DVC native in-process COM plugin registered for current user");
+                log("Plugin DLL: " + plugin);
+                log("IPC session: " + PipeProtocol.PipeName);
             }
         }
 
@@ -142,9 +120,13 @@ namespace Rdptun.App
 
             ProcessStartInfo psi = new ProcessStartInfo("mstsc.exe", "\"" + _rdpFile + "\"")
             {
-                UseShellExecute = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Minimized
             };
+            CopyEnvironment(psi, "RDPTUN_PIPE");
+            CopyEnvironment(psi, "RDPTUN_TRACE");
+            CopyEnvironment(psi, "RDPTUN_CLSID");
 
             _mstsc = Process.Start(psi);
             if (_mstsc == null)
@@ -155,7 +137,6 @@ namespace Rdptun.App
             {
                 CleanupCredential();
                 CleanupFile();
-                StopPluginHost(null);
                 Action handler = Exited;
                 if (handler != null) handler();
             };
@@ -167,10 +148,17 @@ namespace Rdptun.App
                 log("Headless RDP transport started for " + fullAddress + "; waiting for rdptun DVC");
         }
 
+        private static void CopyEnvironment(ProcessStartInfo psi, string name)
+        {
+            string value = Environment.GetEnvironmentVariable(name);
+            if (!string.IsNullOrEmpty(value))
+                psi.EnvironmentVariables[name] = value;
+        }
+
         private void PluginActivationDiagnostic(string tracePath, Action<string> log)
         {
             string lastText = string.Empty;
-            for (int i = 0; i < 32 && !_disposed; i++)
+            for (int i = 0; i < 40 && !_disposed; i++)
             {
                 Thread.Sleep(250);
                 try
@@ -181,15 +169,15 @@ namespace Rdptun.App
                     string text = File.ReadAllText(tracePath);
                     lastText = text;
                     bool factoryCalled = text.IndexOf("CLASSFACTORY CreateInstance", StringComparison.OrdinalIgnoreCase) >= 0;
-                    bool initializeCalled = text.IndexOf("IWTSPlugin.Initialize called", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool initializeCalled = text.IndexOf("IWTSPlugin.Initialize ENTER", StringComparison.OrdinalIgnoreCase) >= 0;
                     if (!factoryCalled && !initializeCalled)
                         continue;
 
                     if (log != null)
                     {
-                        log("mstsc reached DVC COM activation path");
+                        log("mstsc reached DVC in-process COM activation path");
                         string[] lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-                        int start = Math.Max(0, lines.Length - 12);
+                        int start = Math.Max(0, lines.Length - 16);
                         for (int n = start; n < lines.Length; n++)
                             log("PLUGIN TRACE: " + lines[n]);
                     }
@@ -200,11 +188,11 @@ namespace Rdptun.App
 
             if (!_disposed && log != null)
             {
-                log("DIAGNOSTIC: mstsc did not reach DVC COM activation within 8 seconds");
+                log("DIAGNOSTIC: mstsc did not reach DVC in-process COM activation within 10 seconds");
                 if (!string.IsNullOrWhiteSpace(lastText))
                 {
                     string[] lines = lastText.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-                    int start = Math.Max(0, lines.Length - 8);
+                    int start = Math.Max(0, lines.Length - 12);
                     for (int n = start; n < lines.Length; n++)
                         log("PLUGIN TRACE: " + lines[n]);
                 }
@@ -257,39 +245,10 @@ namespace Rdptun.App
             };
             using (Process p = Process.Start(psi))
             {
-                string o = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+                string output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
                 p.WaitForExit();
                 if (p.ExitCode != 0)
-                    throw new InvalidOperationException("cmdkey failed: " + o);
-            }
-        }
-
-        private static void StopPluginHost(Action<string> log)
-        {
-            lock (PluginHostLock)
-            {
-                Process host = _pluginHost;
-                _pluginHost = null;
-                if (host == null)
-                    return;
-                try
-                {
-                    int pid = host.Id;
-                    if (!host.HasExited)
-                    {
-                        host.Kill();
-                        host.WaitForExit(2000);
-                    }
-                    if (log != null) log("DVC COM LocalServer stopped, pid=" + pid);
-                }
-                catch (Exception ex)
-                {
-                    if (log != null) log("DVC COM LocalServer cleanup: " + ex.Message);
-                }
-                finally
-                {
-                    try { host.Dispose(); } catch { }
-                }
+                    throw new InvalidOperationException("cmdkey failed: " + output);
             }
         }
 
@@ -320,7 +279,6 @@ namespace Rdptun.App
             }
             catch { }
 
-            StopPluginHost(null);
             CleanupCredential();
             CleanupFile();
             if (_mstsc != null) _mstsc.Dispose();
