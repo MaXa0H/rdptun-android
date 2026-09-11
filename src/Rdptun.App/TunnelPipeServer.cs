@@ -1,6 +1,8 @@
 using System;
 using System.IO;
 using System.IO.Pipes;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Threading;
 using Rdptun.Common;
 
@@ -26,17 +28,45 @@ namespace Rdptun.App
             _thread.Start();
         }
 
+        private static PipeSecurity CreatePipeSecurity()
+        {
+            WindowsIdentity identity = WindowsIdentity.GetCurrent();
+            SecurityIdentifier user = identity.User;
+            if (user == null)
+                throw new InvalidOperationException("Could not determine current Windows user SID");
+
+            PipeSecurity security = new PipeSecurity();
+            security.SetAccessRuleProtection(true, false);
+            security.AddAccessRule(new PipeAccessRule(
+                user,
+                PipeAccessRights.FullControl,
+                AccessControlType.Allow));
+            security.AddAccessRule(new PipeAccessRule(
+                new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+                PipeAccessRights.FullControl,
+                AccessControlType.Allow));
+            return security;
+        }
+
         private void ServerLoop()
         {
             while (_running)
             {
                 try
                 {
+                    PipeSecurity security = CreatePipeSecurity();
                     using (NamedPipeServerStream pipe = new NamedPipeServerStream(
-                        PipeProtocol.PipeName, PipeDirection.InOut, 1,
-                        PipeTransmissionMode.Byte, PipeOptions.None, 65536, 65536))
+                        PipeProtocol.PipeName,
+                        PipeDirection.InOut,
+                        1,
+                        PipeTransmissionMode.Byte,
+                        PipeOptions.None,
+                        65536,
+                        65536,
+                        security))
                     {
                         _pipe = pipe;
+                        RaiseStatus("IPC pipe ready for current user");
                         pipe.WaitForConnection();
                         RaiseStatus("plugin IPC connected");
 
