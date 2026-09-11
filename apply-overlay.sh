@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# CI overlay installer for FreeRDP 3.31.1
 if [[ $# -ne 1 ]]; then
   echo "Usage: $0 /path/to/freerdp-3.31.1" >&2
   exit 2
