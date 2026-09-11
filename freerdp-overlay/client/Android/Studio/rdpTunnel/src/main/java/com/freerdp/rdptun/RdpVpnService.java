@@ -10,6 +10,7 @@ import android.net.Uri;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
+import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
 
@@ -29,12 +30,15 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
     public static final String EXTRA_USER = "user";
     public static final String EXTRA_PASSWORD = "password";
 
+    private static final String TAG = "RdpVpnService";
     private static final String NOTIF_CHANNEL = "rdptun";
     private static final int NOTIF_ID = 77;
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private volatile long instance = 0;
     private volatile boolean stopping = false;
+    private volatile boolean freeRdpReady = false;
+    private volatile String freeRdpInitError = null;
     private String serverIpv4;
 
     @Override
@@ -43,7 +47,17 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
         NotificationManager nm = getSystemService(NotificationManager.class);
         nm.createNotificationChannel(new NotificationChannel(
                 NOTIF_CHANNEL, "RDP Tunnel", NotificationManager.IMPORTANCE_LOW));
-        LibFreeRDP.setEventListener(this);
+
+        try {
+            // This is deliberately guarded. Accessing LibFreeRDP triggers its static
+            // native-library loader. If a device cannot load one of the .so files,
+            // keep the VPN process alive long enough to expose the actual error.
+            LibFreeRDP.setEventListener(this);
+            freeRdpReady = true;
+        } catch (Throwable t) {
+            freeRdpInitError = describe(t);
+            Log.e(TAG, "FreeRDP initialization failed", t);
+        }
     }
 
     @Override
@@ -61,9 +75,15 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
         String user = intent.getStringExtra(EXTRA_USER);
         String password = intent.getStringExtra(EXTRA_PASSWORD);
 
-        startForegroundCompat(buildNotification("Resolving server…"));
+        startForegroundCompat(buildNotification("VPN service started"));
         stopping = false;
 
+        if (!freeRdpReady) {
+            updateNotification("FreeRDP load failed: " + freeRdpInitError);
+            return START_NOT_STICKY;
+        }
+
+        updateNotification("Resolving server…");
         worker.execute(() -> connectRdp(host, port, user, password));
         return START_NOT_STICKY;
     }
@@ -72,7 +92,7 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
         long inst = 0;
         try {
             serverIpv4 = resolveIpv4(host);
-            updateNotification("Connecting RDP to " + serverIpv4 + ":" + port);
+            updateNotification("Creating FreeRDP instance…");
 
             Uri uri = new Uri.Builder()
                     .scheme("freerdp")
@@ -99,22 +119,31 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
                     .build();
 
             inst = LibFreeRDP.newInstance(this);
+            if (inst == 0)
+                throw new IllegalStateException("LibFreeRDP.newInstance returned 0");
+
             instance = inst;
+            updateNotification("Parsing RDP settings…");
             if (!LibFreeRDP.setConnectionInfo(this, inst, uri))
                 throw new IllegalStateException("FreeRDP argument parsing failed");
 
-            LibFreeRDP.connect(inst);
+            updateNotification("Connecting RDP to " + serverIpv4 + ":" + port + "…");
+            if (!LibFreeRDP.connect(inst))
+                throw new IllegalStateException("LibFreeRDP.connect returned false");
         } catch (Throwable t) {
-            updateNotification("Failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            Log.e(TAG, "RDP connection failed", t);
+            updateNotification("Failed: " + describe(t));
         } finally {
             if (inst != 0) {
-                try { LibFreeRDP.freeInstance(inst); } catch (Throwable ignored) {}
+                try { LibFreeRDP.freeInstance(inst); } catch (Throwable t) {
+                    Log.e(TAG, "FreeRDP freeInstance failed", t);
+                }
             }
             if (instance == inst)
                 instance = 0;
-            RdpTunnelNative.closeTun();
-            if (!stopping)
-                stopSelf();
+            safeCloseTun();
+            // Keep the foreground service alive on failure so its notification keeps
+            // the last diagnostic stage visible. The Disconnect action stops it.
         }
     }
 
@@ -136,11 +165,13 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
         if (inst != instance || stopping)
             return;
         try {
+            updateNotification("RDP connected; creating VPN TUN…");
             establishVpn();
             updateNotification("Connected — traffic via RDP");
         } catch (Throwable t) {
-            updateNotification("VPN setup failed: " + t.getMessage());
-            LibFreeRDP.disconnect(inst);
+            Log.e(TAG, "VPN setup failed", t);
+            updateNotification("VPN setup failed: " + describe(t));
+            try { LibFreeRDP.disconnect(inst); } catch (Throwable ignored) {}
         }
     }
 
@@ -153,9 +184,8 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
                 .addDnsServer("1.1.1.1")
                 .setBlocking(true);
 
-        // Android 12 / API 31 does not have Builder.excludeRoute().
-        // Keep this app itself outside the VPN so the underlying RDP TCP socket
-        // continues to use the physical network and cannot loop back into TUN.
+        // API 31-compatible loop prevention: the app hosting the RDP socket is
+        // excluded from its own VPN. Other apps remain routed into the VPN TUN.
         b.addDisallowedApplication(getPackageName());
 
         ParcelFileDescriptor pfd = b.establish();
@@ -163,7 +193,15 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
             throw new IllegalStateException("VpnService.Builder.establish() returned null");
 
         int fd = pfd.detachFd();
-        if (!RdpTunnelNative.attachTunFd(fd)) {
+        boolean accepted;
+        try {
+            accepted = RdpTunnelNative.attachTunFd(fd);
+        } catch (Throwable t) {
+            try { ParcelFileDescriptor.adoptFd(fd).close(); } catch (IOException ignored) {}
+            throw new IllegalStateException("rdptun JNI attachTunFd failed: " + describe(t), t);
+        }
+
+        if (!accepted) {
             try { ParcelFileDescriptor.adoptFd(fd).close(); } catch (IOException ignored) {}
             throw new IllegalStateException("Native rdptun did not accept TUN fd");
         }
@@ -181,7 +219,7 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
 
     @Override
     public void OnDisconnected(long inst) {
-        RdpTunnelNative.closeTun();
+        safeCloseTun();
         updateNotification("Disconnected");
     }
 
@@ -194,20 +232,36 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
     @Override
     public void onDestroy() {
         stopping = true;
-        RdpTunnelNative.closeTun();
-        LibFreeRDP.setEventListener(null);
+        safeCloseTun();
+        try { LibFreeRDP.setEventListener(null); } catch (Throwable ignored) {}
         worker.shutdownNow();
         super.onDestroy();
     }
 
     private void stopTunnel() {
         stopping = true;
-        RdpTunnelNative.closeTun();
+        safeCloseTun();
         long inst = instance;
-        if (inst != 0)
-            LibFreeRDP.disconnect(inst);
+        if (inst != 0) {
+            try { LibFreeRDP.disconnect(inst); } catch (Throwable ignored) {}
+        }
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
+    }
+
+    private void safeCloseTun() {
+        try {
+            RdpTunnelNative.closeTun();
+        } catch (Throwable t) {
+            Log.e(TAG, "rdptun JNI closeTun failed", t);
+        }
+    }
+
+    private static String describe(Throwable t) {
+        String msg = t.getMessage();
+        if (msg == null || msg.isEmpty())
+            return t.getClass().getSimpleName();
+        return t.getClass().getSimpleName() + ": " + msg;
     }
 
     private Notification buildNotification(String text) {
@@ -218,12 +272,14 @@ public class RdpVpnService extends VpnService implements LibFreeRDP.EventListene
                 .setSmallIcon(android.R.drawable.stat_sys_upload_done)
                 .setContentTitle("RDP Tunnel")
                 .setContentText(text)
+                .setStyle(new NotificationCompat.BigTextStyle().bigText(text))
                 .setOngoing(true)
                 .addAction(0, "Disconnect", stopPi)
                 .build();
     }
 
     private void updateNotification(String text) {
+        Log.i(TAG, text);
         NotificationManager nm = getSystemService(NotificationManager.class);
         nm.notify(NOTIF_ID, buildNotification(text));
     }
