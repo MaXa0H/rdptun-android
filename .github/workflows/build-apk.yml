@@ -68,6 +68,8 @@ jobs:
           TOOLS_VERSION=36.0.0
           NDK_VERSION=29.0.13113456
           CMAKE_VERSION=4.1.2
+          VERSION_NAME=3.31.1-rdptun1
+          VERSION_CODE=331011
           SPLIT_ENABLED=false
           BUILD_UNIVERSAL=true
           SPLIT_ARCHITECTURES=arm64-v8a
